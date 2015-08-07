@@ -808,6 +808,10 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	result = -EINVAL;
 	break;
       }
+      if (filter) {
+	delete filter;
+	filter = NULL;
+      }
       result = get_pgls_filter(bp, &filter);
       if (result < 0)
         break;
@@ -951,8 +955,6 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	dout(10) << " pgnls result=" << result << " outdata.length()="
 		 << osd_op.outdata.length() << dendl;
       }
-      delete filter;
-      filter = NULL;
       break;
 
     case CEPH_OSD_OP_PGLS_FILTER:
@@ -964,6 +966,10 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	dout(0) << "unable to decode PGLS_FILTER description in " << *m << dendl;
 	result = -EINVAL;
 	break;
+      }
+      if (filter) {
+	delete filter;
+	filter = NULL;
       }
       result = get_pgls_filter(bp, &filter);
       if (result < 0)
@@ -1100,8 +1106,6 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	dout(10) << " pgls result=" << result << " outdata.length()="
 		 << osd_op.outdata.length() << dendl;
       }
-      delete filter;
-      filter = NULL;
       break;
 
     case CEPH_OSD_OP_PG_HITSET_LS:
