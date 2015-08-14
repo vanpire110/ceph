@@ -55,7 +55,7 @@ using std::runtime_error;
 #undef dout_prefix
 #define dout_prefix *_dout << "librados: "
 
-#define RADOS_LIST_MAX_ENTRIES 1024
+#define RADOS_LIST_MAX_ENTRIES 1
 
 /*
  * Structure of this file
