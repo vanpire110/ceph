@@ -196,8 +196,8 @@ Client::Client(Messenger *m, MonClient *mc)
   _dir_vxattrs_name_size = _vxattrs_calcu_name_size(_dir_vxattrs);
   _file_vxattrs_name_size = _vxattrs_calcu_name_size(_file_vxattrs);
 
-  user_id = cct->_conf->client_user_id;
-  group_id = cct->_conf->client_group_id;
+  user_id = cct->_conf->client_mount_uid;
+  group_id = cct->_conf->client_mount_gid;
 
   lru.lru_set_max(cct->_conf->client_cache_size);
   lru.lru_set_midpoint(cct->_conf->client_cache_mid);
@@ -1468,9 +1468,9 @@ int Client::make_request(MetaRequest *request,
     oldest_tid = tid;
 
   if (uid < 0)
-    uid = user_id >= 0 ? user_id : getuid();
+    uid = get_uid();
   if (gid < 0)
-    gid = group_id >= 0 ? group_id : getgid();
+    gid = get_gid();
 
   request->set_caller_uid(uid);
   request->set_caller_gid(gid);
@@ -2944,10 +2944,8 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
 				   flush,
 				   cap->mseq,
                                    cap_epoch_barrier);
-  if (user_id >= 0)
-    m->caller_uid = user_id;
-  if (group_id >= 0)
-    m->caller_gid = group_id;
+  m->caller_uid = in->cap_dirtier_uid;
+  m->caller_gid = in->cap_dirtier_gid;
 
   m->head.issue_seq = cap->issue_seq;
   m->set_tid(flush_tid);
@@ -4338,6 +4336,10 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, MCl
 	  << " cleaned " << ccap_string(cleaned) << " on " << *in
 	  << " with " << ccap_string(dirty) << dendl;
 
+  if (!dirty) {
+    in->cap_dirtier_uid = -1;
+    in->cap_dirtier_gid = -1;
+  }
 
   if (!cleaned) {
     ldout(cct, 10) << " tid " << m->get_client_tid() << " != any cap bit tids" << dendl;
@@ -4873,7 +4875,7 @@ int Client::mount(const std::string &mount_root)
     MetaRequest *req = new MetaRequest(CEPH_MDS_OP_GETATTR);
     req->set_filepath(fp);
     req->head.args.getattr.mask = CEPH_STAT_CAP_INODE_ALL;
-    int res = make_request(req, cct->_conf->client_mount_uid, cct->_conf->client_mount_gid);
+    int res = make_request(req, -1, -1);
     if (res < 0) {
       if (res == -EACCES && root) {
 	ldout(cct, 1) << __func__ << " EACCES on parent of mount point; quotas may not work" << dendl;
@@ -5612,9 +5614,19 @@ int Client::_setattr(Inode *in, struct stat *attr, int mask, int uid, int gid,
       is_quota_bytes_exceeded(in, (unsigned long)attr->st_size - in->size)) {
     return -EDQUOT;
   }
+
+  if (uid < 0) {
+    uid = get_uid();
+    gid = get_gid();
+  }
+
   // make the change locally?
-  if ((uid >= 0 && user_id >= 0 && uid != user_id) ||
-      (gid >= 0 && group_id >= 0 && gid != group_id)) {
+  if ((in->cap_dirtier_uid >= 0 && uid != in->cap_dirtier_uid) ||
+      (in->cap_dirtier_gid >= 0 && gid != in->cap_dirtier_gid)) {
+    ldout(cct, 10) << __func__ << " caller " << uid << ":" << gid
+		   << " != cap dirtier " << in->cap_dirtier_uid << ":"
+		   << in->cap_dirtier_gid << ", forcing sync setattr"
+		   << dendl;
     if (!mask)
       mask |= CEPH_SETATTR_CTIME;
     goto force_request;
@@ -5623,6 +5635,8 @@ int Client::_setattr(Inode *in, struct stat *attr, int mask, int uid, int gid,
   if (!mask) {
     // caller just needs us to bump the ctime
     in->ctime = ceph_clock_now(cct);
+    in->cap_dirtier_uid = uid;
+    in->cap_dirtier_gid = gid;
     if (issued & CEPH_CAP_AUTH_EXCL)
       mark_caps_dirty(in, CEPH_CAP_AUTH_EXCL);
     else if (issued & CEPH_CAP_FILE_EXCL)
@@ -5636,6 +5650,8 @@ int Client::_setattr(Inode *in, struct stat *attr, int mask, int uid, int gid,
   if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
     if (mask & CEPH_SETATTR_MODE) {
       in->ctime = ceph_clock_now(cct);
+      in->cap_dirtier_uid = uid;
+      in->cap_dirtier_gid = gid;
       in->mode = (in->mode & ~07777) | (attr->st_mode & 07777);
       mark_caps_dirty(in, CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_MODE;
@@ -5643,6 +5659,8 @@ int Client::_setattr(Inode *in, struct stat *attr, int mask, int uid, int gid,
     }
     if (mask & CEPH_SETATTR_UID) {
       in->ctime = ceph_clock_now(cct);
+      in->cap_dirtier_uid = uid;
+      in->cap_dirtier_gid = gid;
       in->uid = attr->st_uid;
       mark_caps_dirty(in, CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_UID;
@@ -5650,6 +5668,8 @@ int Client::_setattr(Inode *in, struct stat *attr, int mask, int uid, int gid,
     }
     if (mask & CEPH_SETATTR_GID) {
       in->ctime = ceph_clock_now(cct);
+      in->cap_dirtier_uid = uid;
+      in->cap_dirtier_gid = gid;
       in->gid = attr->st_gid;
       mark_caps_dirty(in, CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_GID;
@@ -5663,6 +5683,8 @@ int Client::_setattr(Inode *in, struct stat *attr, int mask, int uid, int gid,
       if (mask & CEPH_SETATTR_ATIME)
         in->atime = utime_t(stat_get_atime_sec(attr), stat_get_atime_nsec(attr));
       in->ctime = ceph_clock_now(cct);
+      in->cap_dirtier_uid = uid;
+      in->cap_dirtier_gid = gid;
       in->time_warp_seq++;
       mark_caps_dirty(in, CEPH_CAP_FILE_EXCL);
       mask &= ~(CEPH_SETATTR_MTIME|CEPH_SETATTR_ATIME);
@@ -6729,8 +6751,8 @@ int Client::open(const char *relpath, int flags, mode_t mode, int stripe_unit,
 
   if (!created) {
     // posix says we can only check permissions of existing files
-    uid_t uid = geteuid();
-    gid_t gid = getegid();
+    uid_t uid = get_uid();
+    gid_t gid = get_gid();
     r = check_permissions(in.get(), flags, uid, gid);
     if (r < 0)
       goto out;
@@ -10067,8 +10089,8 @@ int Client::ll_open(Inode *in, int flags, Fh **fhp, int uid, int gid)
 
   int r;
   if (uid < 0) {
-    uid = geteuid();
-    gid = getegid();
+    uid = get_uid();
+    gid = get_gid();
   }
   if (!cct->_conf->fuse_default_permissions) {
     r = check_permissions(in, flags, uid, gid);
