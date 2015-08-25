@@ -8,7 +8,7 @@ AC_PREREQ(2.59)
 # VERSION define is not used by the code.  It gets a version string
 # from 'git describe'; see src/ceph_ver.[ch]
 
-AC_INIT([ceph], [9.0.2], [ceph-devel@vger.kernel.org])
+AC_INIT([ceph], [9.0.3], [ceph-devel@vger.kernel.org])
 
 AX_CXX_COMPILE_STDCXX_11(, mandatory)
 
@@ -953,6 +953,11 @@ AC_CHECK_HEADERS([ \
 	syslog.h \
 	utime.h \
 ])
+
+# name_to_handle_at
+AC_CHECK_FUNC([name_to_handle_at],
+	[AC_DEFINE([HAVE_NAME_TO_HANDLE_AT], [], [name_to_handle_at exists])],
+	[])
 
 # sync_file_range
 AC_CHECK_FUNC([sync_file_range],
