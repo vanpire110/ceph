@@ -24,6 +24,10 @@
 #include <sys/utsname.h>
 #include <sys/uio.h>
 
+#include <boost/lexical_cast.hpp>
+#include <boost/spirit/include/qi.hpp>
+#include <boost/fusion/include/std_pair.hpp>
+
 #if defined(__linux__)
 #include <linux/falloc.h>
 #endif
@@ -1913,6 +1917,11 @@ void Client::send_request(MetaRequest *request, MetaSession *session,
       r->releases.swap(request->cap_releases);
   }
   r->set_mdsmap_epoch(mdsmap->get_epoch());
+  if (r->head.op == CEPH_MDS_OP_SETXATTR) {
+    const OSDMap *osdmap = objecter->get_osdmap_read();
+    r->set_osdmap_epoch(osdmap->get_epoch());
+    objecter->put_osdmap_read();
+  }
 
   if (request->mds == -1) {
     request->sent_stamp = ceph_clock_now(cct);
@@ -8985,9 +8994,90 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
   return res;
 }
 
+// XATTRS
+
+// parse a map of keys/values.
+namespace qi = boost::spirit::qi;
+
+template <typename Iterator>
+struct keys_and_values
+  : qi::grammar<Iterator, std::map<string, string>()>
+{
+    keys_and_values()
+      : keys_and_values::base_type(query)
+    {
+      query =  pair >> *(qi::lit(' ') >> pair);
+      pair  =  key >> '=' >> value;
+      key   =  qi::char_("a-zA-Z_") >> *qi::char_("a-zA-Z_0-9");
+      value = +qi::char_("a-zA-Z_0-9");
+    }
+    qi::rule<Iterator, std::map<string, string>()> query;
+    qi::rule<Iterator, std::pair<string, string>()> pair;
+    qi::rule<Iterator, string()> key, value;
+};
+
+int Client::check_data_pool_exist(string name, string value, const OSDMap *osdmap)
+{
+  try {
+    if (name == "layout") {
+      string::iterator begin = value.begin();
+      string::iterator end = value.end();
+      keys_and_values<string::iterator> p;    // create instance of parser
+      std::map<string, string> m;             // map to receive results
+      if (!qi::parse(begin, end, p, m)) {     // returns true if successful
+	return -EINVAL;
+      }
+      string left(begin, end);
+      if (begin != end)
+	return -EINVAL;
+      for (map<string,string>::iterator q = m.begin(); q != m.end(); ++q) {
+        // Skip validation on each attr, we do it once at the end (avoid
+        // rejecting intermediate states if the overall result is ok)
+	int r = check_data_pool_exist(string("layout.") + q->first, q->second, osdmap);
+	if (r < 0)
+	  return r;
+      }
+     } else if (name == "layout.pool") {
+       int64_t pool;
+      try {
+	pool = boost::lexical_cast<unsigned>(value);
+      } catch (boost::bad_lexical_cast const&) {
+	pool = osdmap->lookup_pg_pool_name(value);
+	if (pool < 0) {
+	  return -ENOENT;
+	}
+      }
+    } else {
+      return -EINVAL;
+    }
+  } catch (boost::bad_lexical_cast const&) {
+    return -EINVAL;
+  }
+
+  return 0;
+}
+
 int Client::ll_setxattr(Inode *in, const char *name, const void *value,
 			size_t size, int flags, int uid, int gid)
 {
+  // For setting pool of layout, MetaRequest need osdmap epoch.
+  // There is a race which create a new data pool but client and mds both don't have.
+  // Make client got the latest osdmap which make mds quickly judge whether get newer osdmap.
+  if (strcmp(name, "ceph.file.layout.pool") == 0 ||  strcmp(name, "ceph.dir.layout.pool") == 0 ||
+      strcmp(name, "ceph.file.layout") == 0 || strcmp(name, "ceph.dir.layout") == 0) {
+    string rest(strstr(name, "layout"));
+    string v((const char*)value);
+    const OSDMap *osdmap = objecter->get_osdmap_read();
+    int r = check_data_pool_exist(rest, v, osdmap);
+    objecter->put_osdmap_read();
+
+    if (r == -ENOENT) {
+      C_SaferCond ctx;
+      objecter->wait_for_latest_osdmap(&ctx);
+      ctx.wait();
+    }
+  }
+
   Mutex::Locker lock(client_lock);
 
   vinodeno_t vino = _get_vino(in);
