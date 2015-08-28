@@ -1801,6 +1801,13 @@ int OSD::init()
     goto out;
   }
 
+  if (!superblock.compat_features.incompat.contains(CEPH_OSD_FEATURE_INCOMPAT_PGMETA)) {
+    derr << "OSD store does not have PGMETA feature." << dendl;
+    derr << "You must first upgrade to hammer." << dendl;
+    r = -EINVAL;
+    goto out;
+  }
+
   if (osd_compat.compare(superblock.compat_features) < 0) {
     derr << "The disk uses features unsupported by the executable." << dendl;
     derr << " ondisk features " << superblock.compat_features << dendl;
@@ -5162,6 +5169,12 @@ void OSD::do_command(Connection *con, ceph_tid_t tid, vector<string>& cmd, buffe
 
     // clean up
     store->queue_transaction_and_cleanup(osr.get(), cleanupt);
+    {
+      C_SaferCond waiter;
+      if (!osr->flush_commit(&waiter)) {
+	waiter.wait();
+      }
+    }
 
     uint64_t rate = (double)count / (end - start);
     if (f) {
@@ -7839,12 +7852,17 @@ void OSD::do_recovery(PG *pg, ThreadPool::TPHandle &handle)
     dout(20) << "  active was " << recovery_oids[pg->info.pgid] << dendl;
 #endif
     
+    int started;
+    bool more = pg->start_recovery_ops(max, handle, &started);
+    dout(10) << "do_recovery started " << started << "/" << max << " on " << *pg << dendl;
+    // If no recovery op is started, don't bother to manipulate the RecoveryCtx
+    if (!started && (more || !pg->have_unfound())) {
+      pg->unlock();
+      goto out;
+    }
+
     PG::RecoveryCtx rctx = create_context();
     rctx.handle = &handle;
-
-    int started;
-    bool more = pg->start_recovery_ops(max, &rctx, handle, &started);
-    dout(10) << "do_recovery started " << started << "/" << max << " on " << *pg << dendl;
 
     /*
      * if we couldn't start any recovery ops and things are still
@@ -8708,6 +8726,15 @@ int OSD::init_op_flags(OpRequestRef& op)
       }
       break;
 
+    case CEPH_OSD_OP_READ:
+    case CEPH_OSD_OP_SYNC_READ:
+    case CEPH_OSD_OP_SPARSE_READ:
+      if (m->ops.size() == 1 &&
+          (iter->op.flags & CEPH_OSD_OP_FLAG_FADVISE_NOCACHE ||
+           iter->op.flags & CEPH_OSD_OP_FLAG_FADVISE_DONTNEED)) {
+        op->set_skip_promote();
+      }
+      break;
     default:
       break;
     }

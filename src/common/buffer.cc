@@ -24,6 +24,7 @@
 #include "common/RWLock.h"
 #include "include/types.h"
 #include "include/compat.h"
+#include "include/inline_memory.h"
 #if defined(HAVE_XIO)
 #include "msg/xio/XioMsg.h"
 #endif
@@ -36,10 +37,6 @@
 
 #include <ostream>
 namespace ceph {
-
-#if defined(__GNUC__) && defined(__x86_64__)
-  typedef unsigned uint128_t __attribute__ ((mode (TI)));
-#endif
 
 #ifdef BUFFER_DEBUG
 static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
@@ -786,32 +783,8 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
     if (o+l > _len)
         throw end_of_buffer();
     char* src =  _raw->data + _off + o;
-    if (l > 8) {
-        memcpy(dest, src, l);
-        return;
-    }
-    switch (l) {
-        case 8:
-            *((uint64_t*)(dest)) = *((uint64_t*)(src));
-            return;
-        case 4:
-            *((uint32_t*)(dest)) = *((uint32_t*)(src));
-            return;
-        case 3:
-            *((uint16_t*)(dest)) = *((uint16_t*)(src));
-            *((uint8_t*)(dest+2)) = *((uint8_t*)(src+2));
-            return;
-        case 2:
-            *((uint16_t*)(dest)) = *((uint16_t*)(src));
-            return;
-        case 1:
-            *((uint8_t*)(dest)) = *((uint8_t*)(src));
-            return;
-        default:
-            memcpy(dest, src, l);
-            return;
-        }
-    }
+    maybe_inline_memcpy(dest, src, l, 8);
+  }
 
   unsigned buffer::ptr::wasted()
   {
@@ -836,50 +809,7 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
 
   bool buffer::ptr::is_zero() const
   {
-    const char* data = c_str();
-    const char* max = data + _len;
-    const char* max32 = data + (_len / sizeof(uint32_t))*sizeof(uint32_t);
-#if defined(__GNUC__) && defined(__x86_64__)
-    // we do have XMM registers in x86-64, so if we need to check at least
-    // 16 bytes, make use of them 
-    int left = _len;
-    if (left / sizeof(uint128_t) > 0) {
-        // align data pointer to 16 bytes, otherwise it'll segfault due to bug
-        // in (at least some) GCC versions (using MOVAPS instead of MOVUPS).
-        // check up to 15 first bytes while at it.
-        while (((unsigned long long)data) & 15) {
-            if (*(uint8_t*)data != 0) {
-                return false;
-            }
-            data += sizeof(uint8_t);
-            left--;
-        }
-
-        const char* max128 = data + (left / sizeof(uint128_t))*sizeof(uint128_t);
-
-        while (data < max128) {
-            if (*(uint128_t*)data != 0) {
-                return false;
-            }
-            data += sizeof(uint128_t);
-        }
-    }
-#endif
-    while (data < max32) {
-        if (*(uint32_t*)data != 0) {
-            return false;
-        }
-        data += sizeof(uint32_t);
-    }
-
-    while (data < max) {
-        if (*(uint8_t*)data != 0) {
-            return false;
-        }
-        data += sizeof(uint8_t);
-    }
-
-    return true;
+    return mem_is_zero(c_str(), _len);
   }
 
   unsigned buffer::ptr::append(char c)
@@ -897,47 +827,8 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
     assert(_raw);
     assert(l <= unused_tail_length());
     char* c = _raw->data + _off + _len;
-    if (l <= 32) {
-        _len += l;
-        switch (l) {
-            case 16:
-                *((uint64_t*)(c)) = *((uint64_t*)(p));
-                *((uint64_t*)(c+sizeof(uint64_t))) = *((uint64_t*)(p+sizeof(uint64_t)));
-                return _len + _off;
-            case 8:
-                *((uint64_t*)(c)) = *((uint64_t*)(p));
-                return _len + _off;
-            case 4:
-                *((uint32_t*)(c)) = *((uint32_t*)(p));
-                return _len + _off;
-            case 2:
-                *((uint16_t*)(c)) = *((uint16_t*)(p));
-                return _len + _off;
-            case 1:
-                *((uint8_t*)(c)) = *((uint8_t*)(p));
-                return _len + _off;
-        }
-        int cursor = 0;
-        while (l >= sizeof(uint64_t)) {
-            *((uint64_t*)(c + cursor)) = *((uint64_t*)(p + cursor));
-            cursor += sizeof(uint64_t);
-            l -= sizeof(uint64_t);
-        }
-        while (l >= sizeof(uint32_t)) {
-            *((uint32_t*)(c + cursor)) = *((uint32_t*)(p + cursor));
-            cursor += sizeof(uint32_t);
-            l -= sizeof(uint32_t);
-        }
-        while (l > 0) {
-            *(c+cursor) = *(p+cursor);
-            cursor++;
-            l--;
-        }
-    }
-    else {
-        memcpy(c, p, l);
-        _len += l;
-    }
+    maybe_inline_memcpy(c, p, l, 32);
+    _len += l;
     return _len + _off;
   }
     
@@ -949,46 +840,7 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
     char* dest = _raw->data + _off + o;
     if (crc_reset)
         _raw->invalidate_crc();
-    if (l < 64) {
-        switch (l) {
-            case 1:
-                *((uint8_t*)(dest)) = *((uint8_t*)(src));
-                return;
-            case 2:
-                *((uint16_t*)(dest)) = *((uint16_t*)(src));
-                return;
-            case 3:
-                *((uint16_t*)(dest)) = *((uint16_t*)(src));
-                *((uint8_t*)(dest+2)) = *((uint8_t*)(src+2));
-                return;
-            case 4:
-                *((uint32_t*)(dest)) = *((uint32_t*)(src));
-                return;
-            case 8:
-                *((uint64_t*)(dest)) = *((uint64_t*)(src));
-                return;
-            default:
-                int cursor = 0;
-                while (l >= sizeof(uint64_t)) {
-                    *((uint64_t*)(dest + cursor)) = *((uint64_t*)(src + cursor));
-                    cursor += sizeof(uint64_t);
-                    l -= sizeof(uint64_t);
-                }
-                while (l >= sizeof(uint32_t)) {
-                    *((uint32_t*)(dest + cursor)) = *((uint32_t*)(src + cursor));
-                    cursor += sizeof(uint32_t);
-                    l -= sizeof(uint32_t);
-                }
-                while (l > 0) {
-                    *(dest + cursor) = *(src + cursor);
-                    cursor++;
-                    l--;
-                }
-                return;
-        }
-    } else {
-        memcpy(dest, src, l);
-    }
+    maybe_inline_memcpy(dest, src, l, 64);
   }
 
   void buffer::ptr::zero(bool crc_reset)
@@ -1375,6 +1227,10 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
 
   void buffer::list::rebuild()
   {
+    if (_len == 0) {
+      _buffers.clear();
+      return;
+    }
     ptr nb;
     if ((_len & ~CEPH_PAGE_MASK) == 0)
       nb = buffer::create_page_aligned(_len);
@@ -1394,61 +1250,62 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
     }
     _memcopy_count += pos;
     _buffers.clear();
-    _buffers.push_back(nb);
+    if (nb.length())
+      _buffers.push_back(nb);
     invalidate_crc();
   }
 
-void buffer::list::rebuild_aligned(unsigned align)
-{
-  rebuild_aligned_size_and_memory(align, align);
-}
-
-void buffer::list::rebuild_aligned_size_and_memory(unsigned align_size,
-						   unsigned align_memory)
-{
-  std::list<ptr>::iterator p = _buffers.begin();
-  while (p != _buffers.end()) {
-    // keep anything that's already align and sized aligned
-    if (p->is_aligned(align_memory) && p->is_n_align_sized(align_size)) {
-      /*cout << " segment " << (void*)p->c_str()
-	     << " offset " << ((unsigned long)p->c_str() & (align - 1))
-	     << " length " << p->length()
-	     << " " << (p->length() & (align - 1)) << " ok" << std::endl;
-      */
-      ++p;
-      continue;
-    }
-    
-    // consolidate unaligned items, until we get something that is sized+aligned
-    list unaligned;
-    unsigned offset = 0;
-    do {
-      /*cout << " segment " << (void*)p->c_str()
-             << " offset " << ((unsigned long)p->c_str() & (align - 1))
-             << " length " << p->length() << " " << (p->length() & (align - 1))
-             << " overall offset " << offset << " " << (offset & (align - 1))
-	     << " not ok" << std::endl;
-      */
-      offset += p->length();
-      unaligned.push_back(*p);
-      _buffers.erase(p++);
-    } while (p != _buffers.end() &&
-	     (!p->is_aligned(align_memory) ||
-	      !p->is_n_align_sized(align_size) ||
-	      (offset % align_size)));
-    if (!(unaligned.is_contiguous() && unaligned._buffers.front().is_aligned(align_memory))) {
-      ptr nb(buffer::create_aligned(unaligned._len, align_memory));
-      unaligned.rebuild(nb);
-      _memcopy_count += unaligned._len;
-    }
-    _buffers.insert(p, unaligned._buffers.front());
+  void buffer::list::rebuild_aligned(unsigned align)
+  {
+    rebuild_aligned_size_and_memory(align, align);
   }
-}
-
-void buffer::list::rebuild_page_aligned()
-{
-  rebuild_aligned(CEPH_PAGE_SIZE);
-}
+  
+  void buffer::list::rebuild_aligned_size_and_memory(unsigned align_size,
+  						   unsigned align_memory)
+  {
+    std::list<ptr>::iterator p = _buffers.begin();
+    while (p != _buffers.end()) {
+      // keep anything that's already align and sized aligned
+      if (p->is_aligned(align_memory) && p->is_n_align_sized(align_size)) {
+        /*cout << " segment " << (void*)p->c_str()
+  	     << " offset " << ((unsigned long)p->c_str() & (align - 1))
+  	     << " length " << p->length()
+  	     << " " << (p->length() & (align - 1)) << " ok" << std::endl;
+        */
+        ++p;
+        continue;
+      }
+      
+      // consolidate unaligned items, until we get something that is sized+aligned
+      list unaligned;
+      unsigned offset = 0;
+      do {
+        /*cout << " segment " << (void*)p->c_str()
+               << " offset " << ((unsigned long)p->c_str() & (align - 1))
+               << " length " << p->length() << " " << (p->length() & (align - 1))
+               << " overall offset " << offset << " " << (offset & (align - 1))
+  	     << " not ok" << std::endl;
+        */
+        offset += p->length();
+        unaligned.push_back(*p);
+        _buffers.erase(p++);
+      } while (p != _buffers.end() &&
+  	     (!p->is_aligned(align_memory) ||
+  	      !p->is_n_align_sized(align_size) ||
+  	      (offset % align_size)));
+      if (!(unaligned.is_contiguous() && unaligned._buffers.front().is_aligned(align_memory))) {
+        ptr nb(buffer::create_aligned(unaligned._len, align_memory));
+        unaligned.rebuild(nb);
+        _memcopy_count += unaligned._len;
+      }
+      _buffers.insert(p, unaligned._buffers.front());
+    }
+  }
+  
+  void buffer::list::rebuild_page_aligned()
+  {
+    rebuild_aligned(CEPH_PAGE_SIZE);
+  }
 
   // sort-of-like-assignment-op
   void buffer::list::claim(list& bl, unsigned int flags)
