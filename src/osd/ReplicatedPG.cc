@@ -11847,10 +11847,6 @@ void ReplicatedPG::_scrub(
 			     << " expected clone (1) " << next_clone;
 	  ++scrubber.shallow_errors;
 	  ++curclone;
-      if (curclone == snapset.clones.rend())
-	dout(20) << __func__ << " " << mode << " (2) no more clones for " << head << dendl;
-      else
-	dout(20) << __func__ << " " << mode << " (2) next clone should be " << *curclone << dendl;
 	}
       }
     }
@@ -11923,7 +11919,7 @@ void ReplicatedPG::_scrub(
       }
     } else {
       assert(soid.is_snap() && soid.snap != 0);
-      //assert(!head.is_min());
+      assert(!head.is_min());
 
       // If there are missing clones, generate log for each one
       hobject_t next_clone(head);
@@ -11939,10 +11935,6 @@ void ReplicatedPG::_scrub(
 	}
 	// Clones are descending
 	++curclone;
-      if (curclone == snapset.clones.rend())
-	dout(20) << __func__ << " " << mode << " (2) no more clones for " << head << dendl;
-      else
-	dout(20) << __func__ << " " << mode << " (2) next clone should be " << *curclone << dendl;
       }
 
       // If no more clones or next clone should have a lesser snap, so this
@@ -11971,10 +11963,6 @@ void ReplicatedPG::_scrub(
 
       // what's next?
       ++curclone;
-      if (curclone == snapset.clones.rend())
-	dout(20) << __func__ << " " << mode << " no more clones for " << head << dendl;
-      else
-	dout(20) << __func__ << " " << mode << " next clone should be " << *curclone << dendl;
     }
 
     scrub_cstat.add(stat);
@@ -11997,21 +11985,7 @@ void ReplicatedPG::_scrub(
 			 << " expected clone (3) " << next_clone;
       ++scrubber.shallow_errors;
       ++curclone;
-      if (curclone == snapset.clones.rend())
-	dout(20) << __func__ << " " << mode << " (2) no more clones for " << head << dendl;
-      else
-	dout(20) << __func__ << " " << mode << " (2) next clone should be " << *curclone << dendl;
     }
-#if 0
-    if (missing) {
-      if (pool.info.allow_incomplete_clones())
-	dout(20) << __func__ << " " << mode << " " << info.pgid << " " << head
-	         << " skipped remaining clones in cache tier" << dendl;
-      else
-	osd->clog->error() << mode << " " << info.pgid << " " << head
-			   << " missing clones (1)";
-    }
-#endif
   }
   if (missing) {
     assert(!head.is_min());
